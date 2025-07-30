@@ -46,8 +46,9 @@ class FeatureMatchingAgent:
     def extract(self) -> Tuple[List[List[cv2.KeyPoint]], List[np.ndarray]]:
         for g in self.gray:
             h, w = g.shape
+            # scale feature count with image size but keep an upper bound
             nfeat = int(self.max_features * max(h, w) / 500)
-            sift = cv2.SIFT_create(nfeatures=max(nfeat, self.max_features))
+            sift = cv2.SIFT_create(nfeatures=min(nfeat, self.max_features))
             kp, des = sift.detectAndCompute(g, None)
             self.kps.append(kp)
             self.descs.append(des)
@@ -65,7 +66,12 @@ class FeatureMatchingAgent:
                 for m, n in knn:
                     if m.distance < 0.75 * n.distance:
                         good.append(m)
-                matches[(i, j)] = good
+                if good:
+                    matches[(i, j)] = good
+                else:
+                    logging.warning("No matches between %d and %d", i, j)
+                if len(good) < 5:
+                    logging.warning("Few matches (%d) between %d and %d", len(good), i, j)
         return matches
 
 
@@ -93,10 +99,13 @@ class PatchSamplingAgent:
 
     def _extract_patch(self, img: np.ndarray, kp: cv2.KeyPoint) -> np.ndarray:
         half = self.patch_size // 2
-        M = cv2.getRotationMatrix2D(kp.pt, kp.angle, 1.0)
-        rotated = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
+        padded = cv2.copyMakeBorder(img, half, half, half, half, cv2.BORDER_REFLECT101)
+        center = (kp.pt[0] + half, kp.pt[1] + half)
+        scale = kp.size / float(self.patch_size)
+        M = cv2.getRotationMatrix2D(center, kp.angle, scale)
+        rotated = cv2.warpAffine(padded, M, (padded.shape[1], padded.shape[0]),
                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
-        patch = cv2.getRectSubPix(rotated, (self.patch_size, self.patch_size), kp.pt)
+        patch = cv2.getRectSubPix(rotated, (self.patch_size, self.patch_size), center)
         return patch
 
 
@@ -117,7 +126,8 @@ class MatrixBuilderAgent:
         for j, sample in enumerate(self.samples):
             for idx, patch in ((sample.idx_i, sample.patch_i), (sample.idx_j, sample.patch_j)):
                 gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-                val = np.clip(np.mean(gray) / 255.0, 1e-6, 1.0)
+                norm = np.mean(gray) / 255.0
+                val = float(np.clip(norm, 1e-4, 1.0))
                 data_I.append(np.log(val))
                 rows.append(idx)
                 cols.append(j)
@@ -139,6 +149,7 @@ class LowRankSolverAgent:
         Q = np.random.randn(n, 2)
         I = self.I.tocsr()
         W = self.W.tocsr()
+        prev_err = None
         for _ in range(max_iter):
             # update P
             for i in range(m):
@@ -146,7 +157,7 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 Q_i = Q[idx]
-                b = I[i].data
+                b = I[i, idx].toarray().ravel()
                 A = Q_i.T @ Q_i + 1e-6 * np.eye(2)
                 P[i] = np.linalg.solve(A, Q_i.T @ b)
             # update Q
@@ -155,9 +166,15 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 P_j = P[idx]
-                b = I[:, j].data
+                b = I[idx, j].toarray().ravel()
                 A = P_j.T @ P_j + 1e-6 * np.eye(2)
                 Q[j] = np.linalg.solve(A, P_j.T @ b)
+            rows, cols = W.nonzero()
+            recon_vals = (P @ Q.T)[rows, cols]
+            err = np.linalg.norm(I[rows, cols].toarray().ravel() - recon_vals)
+            if prev_err is not None and abs(prev_err - err) < 1e-4:
+                break
+            prev_err = err
         return P, Q
 
     def extract_params(self, P):
@@ -179,9 +196,15 @@ class ColorCorrectionAgent:
     def correct(self):
         out = []
         for img, ci, gi in zip(self.images, self.c, self.gamma):
-            img_f = img.astype(np.float32)
-            img_corr = (img_f / ci) ** (1.0 / gi)
-            img_corr = np.clip(img_corr, 0, 255).astype(np.uint8)
+            img_f = img.astype(np.float32) / 255.0
+            img_lin = np.clip(img_f, 1e-6, 1.0) ** gi
+            if np.isscalar(ci):
+                c_vec = np.array([ci, ci, ci], dtype=np.float32)
+            else:
+                c_vec = np.asarray(ci, dtype=np.float32)
+            img_corr = img_lin / c_vec
+            img_corr = np.clip(img_corr, 0.0, 1.0) ** (1.0 / gi)
+            img_corr = (img_corr * 255.0).astype(np.uint8)
             out.append(img_corr)
         return out
 
@@ -195,12 +218,15 @@ class OutlierDetectionAgent:
         self.Q = Q
 
     def detect(self) -> np.ndarray:
-        recon = self.P @ self.Q.T
-        I_dense = self.I.toarray() if hasattr(self.I, "toarray") else self.I
-        E = I_dense - recon
-        med = np.median(E)
-        mad = np.median(np.abs(E - med))
+        rows, cols = self.I.nonzero()
+        recon_vals = (self.P @ self.Q.T)[rows, cols]
+        obs = self.I[rows, cols].toarray().ravel()
+        residuals = obs - recon_vals
+        med = np.median(residuals)
+        mad = np.median(np.abs(residuals - med))
         thresh = med + 3 * 1.4826 * mad
-        mask = np.abs(E - med) >= thresh
+        mask_vals = np.abs(residuals - med) >= thresh
+        mask = np.zeros_like(self.I.toarray(), dtype=bool)
+        mask[rows, cols] = mask_vals
         return mask
 
