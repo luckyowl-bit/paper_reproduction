@@ -1,0 +1,7 @@
+numpy
+scipy
+opencv-python-headless
+networkx
+Pillow
+tqdm
+scikit-learn
