@@ -46,9 +46,10 @@ class FeatureMatchingAgent:
     def extract(self) -> Tuple[List[List[cv2.KeyPoint]], List[np.ndarray]]:
         for g in self.gray:
             h, w = g.shape
-            # scale feature count with image size but keep an upper bound
+            # scale feature count with image size but keep bounds
             nfeat = int(self.max_features * max(h, w) / 500)
-            sift = cv2.SIFT_create(nfeatures=min(nfeat, self.max_features))
+            nfeat = int(np.clip(nfeat, self.max_features // 2, self.max_features))
+            sift = cv2.SIFT_create(nfeatures=nfeat)
             kp, des = sift.detectAndCompute(g, None)
             self.kps.append(kp)
             self.descs.append(des)
@@ -157,7 +158,7 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 Q_i = Q[idx]
-                b = I[i, idx].toarray().ravel()
+                b = np.asarray(I[i, idx]).ravel()
                 A = Q_i.T @ Q_i + 1e-6 * np.eye(2)
                 P[i] = np.linalg.solve(A, Q_i.T @ b)
             # update Q
@@ -166,12 +167,12 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 P_j = P[idx]
-                b = I[idx, j].toarray().ravel()
+                b = np.asarray(I[idx, j]).ravel()
                 A = P_j.T @ P_j + 1e-6 * np.eye(2)
                 Q[j] = np.linalg.solve(A, P_j.T @ b)
             rows, cols = W.nonzero()
             recon_vals = (P @ Q.T)[rows, cols]
-            err = np.linalg.norm(I[rows, cols].toarray().ravel() - recon_vals)
+            err = np.linalg.norm(np.asarray(I[rows, cols]).ravel() - recon_vals)
             if prev_err is not None and abs(prev_err - err) < 1e-4:
                 break
             prev_err = err
@@ -220,7 +221,7 @@ class OutlierDetectionAgent:
     def detect(self) -> np.ndarray:
         rows, cols = self.I.nonzero()
         recon_vals = (self.P @ self.Q.T)[rows, cols]
-        obs = self.I[rows, cols].toarray().ravel()
+        obs = np.asarray(self.I[rows, cols]).ravel()
         residuals = obs - recon_vals
         med = np.median(residuals)
         mad = np.median(np.abs(residuals - med))
