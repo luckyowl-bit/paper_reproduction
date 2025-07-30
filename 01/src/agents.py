@@ -158,7 +158,8 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 Q_i = Q[idx]
-                b = np.asarray(I[i, idx]).ravel()
+                # ``I[i, idx]`` returns a sparse row, convert to dense
+                b = I[i, idx].toarray().ravel()
                 A = Q_i.T @ Q_i + 1e-6 * np.eye(2)
                 P[i] = np.linalg.solve(A, Q_i.T @ b)
             # update Q
@@ -167,7 +168,7 @@ class LowRankSolverAgent:
                 if len(idx) == 0:
                     continue
                 P_j = P[idx]
-                b = np.asarray(I[idx, j]).ravel()
+                b = I[idx, j].toarray().ravel()
                 A = P_j.T @ P_j + 1e-6 * np.eye(2)
                 Q[j] = np.linalg.solve(A, P_j.T @ b)
             rows, cols = W.nonzero()
